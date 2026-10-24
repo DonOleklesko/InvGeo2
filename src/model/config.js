@@ -25,6 +25,8 @@ export const ZALOZENIA = {
   udzialObjazdow: { v: 0.7, jedn: "", opis: "Część ruchu z zamkniętej ulicy, która przenosi się na objazdy" },
   kosztDrogiNaM: { v: 12000, jedn: "zł/m", opis: "Budowa nowej ulicy (jezdnia, chodniki, oświetlenie, odwodnienie)" },
   kosztMostu: { v: 400e6, jedn: "zł", opis: `Dodatkowy koszt mostu, gdy nowa droga przecina ${MIASTO.rzeka}` },
+  kosztMostuMalego: { v: 70e6, jedn: "zł", opis: "Most przez mniejszą rzekę lub kanał (zamiast mostu na dużej rzece)" },
+  kosztWiaduktu: { v: 60e6, jedn: "zł", opis: "Dodatkowy koszt wiaduktu, gdy nowa droga przecina tory kolejowe" },
   udzialPrzejetegoRuchu: { v: 0.4, jedn: "", opis: "Część ruchu z okolicznych ulic, którą przejmie nowa droga" },
 
   // --- parkingi, P&R, ładowarki, fotowoltaika ---
@@ -129,6 +131,8 @@ export const ZRODLA_ZALOZEN = {
   udzialObjazdow: { z: [], szacunek: true },
   kosztDrogiNaM: { z: ["akk"], szacunek: true },
   kosztMostu: { z: [], szacunek: true },
+  kosztMostuMalego: { z: [], szacunek: true },
+  kosztWiaduktu: { z: [], szacunek: true },
   udzialPrzejetegoRuchu: { z: [], szacunek: true },
   m2NaMiejsce: { z: [], szacunek: true },
   kosztMiejscaParkingowego: { z: [], szacunek: true },

@@ -12,7 +12,7 @@ import "leaflet/dist/leaflet.css";
 import DrawControl from "./DrawControl.jsx";
 import { zaladujGeoman } from "./geoman.js";
 import { LinesLayer, StopsLayer, ParksLayer } from "./TransitLayers.jsx";
-import { PASMA_RUCHU, PASMA_HALASU, pasmo } from "./TrafficPanel.jsx";
+import { PASMA_RUCHU, PASMA_HALASU, pasmo, pasmoZmiany } from "./TrafficPanel.jsx";
 import { MIASTO_BBOX, MIASTO_CENTRUM } from "../data/queries.js";
 import { TYPY } from "../model/config.js";
 import { KLASY_DROG } from "../model/traffic.js";
@@ -50,8 +50,9 @@ function RuchLayer({ stan, tryb }) {
   biezacy.current = { stan, tryb };
   const lista = stan?.lista;
 
+  const rysuj = tryb === "ruch" || tryb === "halas";
   useEffect(() => {
-    if (!lista || tryb === "brak") return;
+    if (!lista || !rysuj) return;
     const renderer = L.canvas({ padding: 0.3, pane: "ruch" });
     const g = L.layerGroup().addTo(map);
     // treść tooltipa liczona dopiero przy najechaniu (z bieżącej godziny), nie dla tysięcy odcinków naraz
@@ -81,10 +82,10 @@ function RuchLayer({ stan, tryb }) {
       linie.current = [];
       style.current = [];
     };
-  }, [map, lista, tryb]);
+  }, [map, lista, tryb, rysuj]);
 
   useEffect(() => {
-    if (!stan || tryb === "brak") return;
+    if (!stan || !rysuj) return;
     lista.forEach(({ o }, i) => {
       const l = linie.current[i];
       if (!l) return;
@@ -102,6 +103,39 @@ function RuchLayer({ stan, tryb }) {
 
   return null;
 }
+
+// Zmiana ruchu dobowego (model rozkładu ruchu): objazdy po zamknięciu ulicy, ruch przejęty przez nową
+// drogę, dodatkowy ruch z osiedla. Czerwone / pomarańczowe – ruchu przybywa, zielone – ubywa;
+// grubość zależy od wielkości zmiany. Canvas – setki odcinków bez spowalniania mapy.
+const ZmianaLayer = memo(function ZmianaLayer({ lista }) {
+  const map = useMap();
+  useEffect(() => {
+    if (!lista?.length) return;
+    const renderer = L.canvas({ padding: 0.3, pane: "ruch" });
+    const g = L.layerGroup().addTo(map);
+    const fmt = (n) => Math.round(n).toLocaleString("pl-PL");
+    for (const z of lista) {
+      if (!z.wsp?.length) continue;
+      const p = z.nowa ? { kolor: "#6741d9" } : pasmoZmiany(z.d);
+      const waga = z.nowa ? 6 : Math.min(9, 2 + Math.abs(z.d) / 1500);
+      L.polyline(z.wsp.map(([lng, lat]) => [lat, lng]), { renderer, pane: "ruch", color: p.kolor, weight: waga, opacity: 0.9, dashArray: z.nowa ? "8 6" : null })
+        .bindTooltip(
+          () =>
+            `<b>${z.nazwa || "ulica bez nazwy"}</b><br>` +
+            (z.nowa
+              ? `Nowa droga: ok. ${fmt(z.d)} poj./dobę`
+              : `${z.d > 0 ? "+" : "−"}${fmt(Math.abs(z.d))} poj./dobę (${z.d > 0 ? "objazd / więcej ruchu" : "mniej ruchu"})<br>dziś ok. ${fmt(z.przed)} → ${fmt(Math.max(0, z.przed + z.d))}`),
+          { sticky: true }
+        )
+        .addTo(g);
+    }
+    return () => {
+      g.remove();
+      renderer.remove();
+    };
+  }, [map, lista]);
+  return null;
+});
 
 // Inwestycje i propozycje rysujemy w SVG: canvas w najwyższym panelu przykrywałby całą mapę
 // i przechwytywał kliknięcia/najechania na parkingi i przystanki pod spodem.
@@ -274,7 +308,7 @@ export default function MapView({
   data, investments, selectedId, onSelect, wynik, drawType, onCreated, onCancelDraw,
   propozycje = [], dodanePropozycje, onAddProposal, onAddFromParking,
   visibleLines, highlightedLines, linesById, onHoverLine, onHoverStop,
-  warstwaRuchu, stanSieci, granica = true, stops, swobodnie, zabudowa,
+  warstwaRuchu, stanSieci, zmianyRuchu, granica = true, stops, swobodnie, zabudowa,
   edytowanyId, onEdytuj, ustawianie, onKlikMapy, onUsunPrzystanek,
 }) {
   const doLatLng = (g) => (g.geometry || g).coordinates.map(([lng, lat]) => [lat, lng]);
@@ -319,6 +353,7 @@ export default function MapView({
       <PanelSvg name="inwestycje" />
 
       <RuchLayer stan={stanSieci} tryb={warstwaRuchu} />
+      {warstwaRuchu === "zmiana" && <ZmianaLayer lista={zmianyRuchu} />}
       <DopasujRozmiar />
 
       <LayersControl position="topright">
@@ -356,7 +391,11 @@ export default function MapView({
                     key={p.id}
                     pane="inwestycje"
                               positions={doLatLng(p.geometry)}
-                    pathOptions={{ color: "#6741d9", weight: 5, opacity: 0.85, dashArray: "4 8" }}
+                    pathOptions={
+                      p.rodzaj === "linia"
+                        ? { color: TYPY.autobus.kolor, weight: 5, opacity: 0.9, dashArray: "1 9", lineCap: "round" }
+                        : { color: "#6741d9", weight: 5, opacity: 0.85, dashArray: "4 8" }
+                    }
                   >
                     <Tooltip sticky>{p.nazwa}</Tooltip>
                     {tresc}

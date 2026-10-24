@@ -8,9 +8,14 @@
 //     (o ile procent dłużej jedzie się niż przy pustych drogach),
 //  5) wpływ inwestycji wariantu (osiedla, drogi, zamknięcia, P&R, linie),
 //  6) hałas drogowy (Lden) z natężenia ruchu i liczba osób narażonych.
+// Gdy jest już policzony MODEL ROZKŁADU RUCHU (przeplywy.js – podróże między rejonami
+// rozłożone na sieć), ruch bazowy i skutki nowych dróg, zamknięć ulic i osiedli pochodzą z niego
+// (data.przeplywy: { baza, wyniki: Map(klucz scenariusza → wynik) }); kroki 1) i 5) dla tych
+// inwestycji są wtedy tylko zapasem do czasu, aż wątek skończy liczyć.
 // UWAGA: to model szacunkowy, a nie pomiary. Wyniki służą do porównań wariantów.
 import * as turf from "@turf/turf";
 import { z } from "./config.js";
+import { kluczScenariusza, czyRuchowa } from "./przeplywy.js";
 import { MIASTO_CENTRUM } from "../data/queries.js";
 
 // --- parametry klas dróg OSM ---
@@ -114,8 +119,9 @@ const cacheSieci = new WeakMap();
 export function zbudujSiec(data) {
   const roads = data.roads;
   if (!roads?.features?.length) return null;
+  const bazaRuchu = data.przeplywy?.baza || null;
   const c = cacheSieci.get(roads);
-  if (c && c.zones === data.zones) return c.siec;
+  if (c && c.zones === data.zones && c.baza === bazaRuchu) return c.siec;
 
   const centrum = xy([MIASTO_CENTRUM[1], MIASTO_CENTRUM[0]]);
   // strefy pracy: środek + powierzchnia (ha)
@@ -179,7 +185,9 @@ export function zbudujSiec(data) {
     if (/^most\b/i.test(f.properties.name || "")) sdr *= 1.6;
     // jezdnia jednokierunkowa przenosi ok. połowę ruchu przekroju;
     // droga dwukierunkowa z 1 pasem na kierunek – mniej ruchu niż dwujezdniowa tej klasy
-    const sdrJezdni = oneway ? sdr / 2 : pasyKier >= 2 ? sdr : sdr * 0.6;
+    // z modelu rozkładu ruchu (gdy policzony): ruch tej jezdni w obu kierunkach
+    const zModelu = bazaRuchu?.sdr.get(f.properties.id)?.sdr;
+    const sdrJezdni = zModelu ?? (oneway ? sdr / 2 : pasyKier >= 2 ? sdr : sdr * 0.6);
 
     const xs = pts.map((p) => p[0]);
     const ys = pts.map((p) => p[1]);
@@ -202,7 +210,7 @@ export function zbudujSiec(data) {
     });
   }
   const siec = { odcinki, centrum, strefy };
-  cacheSieci.set(roads, { zones: data.zones, siec });
+  cacheSieci.set(roads, { zones: data.zones, baza: bazaRuchu, siec });
   return siec;
 }
 
@@ -236,9 +244,37 @@ export function wplywInwestycji(siec, investments, data) {
   const nowe = [];
   const add = (lista, f) => lista.forEach(([i, d]) => (delta[i] += f(d, i)));
 
+  // MODEL ROZKŁADU RUCHU: nowe drogi, zamknięcia i osiedla liczone razem (jeden scenariusz) –
+  // zmiana ruchu na każdym odcinku to różnica: scenariusz − stan obecny (objazdy, przejęty ruch)
+  const baza = data?.przeplywy?.baza;
+  const wyn = baza && data.przeplywy.wyniki?.get(kluczScenariusza(investments));
+  const zModelu = !!wyn;
+  if (zModelu) {
+    siec.odcinki.forEach((o, i) => {
+      const b = baza.sdr.get(o.id)?.sdr;
+      if (b === undefined) return; // odcinek poza modelem – bez zmian
+      delta[i] = (wyn.sdr.get(o.id)?.sdr ?? 0) - b; // brak w scenariuszu = odcinek zamknięty
+    });
+  }
+
   for (const inv of investments) {
     const p = inv.params || {};
     try {
+      if (zModelu && czyRuchowa(inv)) {
+        if (inv.typ === "droga") {
+          const klasa = KLASA_INWESTYCJI[p.klasa] || "secondary";
+          const K = KLASY_DROG[klasa];
+          const g = inv.geometry.geometry || inv.geometry;
+          const pts = g.coordinates.map(xy);
+          let dl = 0;
+          for (let i = 1; i < pts.length; i++) dl += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+          nowe.push({
+            id: "nowa-" + inv.id, nazwa: inv.nazwa, klasa, wsp: g.coordinates, pts, mid: pts[Math.floor(pts.length / 2)],
+            dl, oneway: false, sdr: wyn.nowe[inv.id] ?? 0, cap: K.pas, kier: 0.6, v0: K.v0, nowa: true,
+          });
+        }
+        continue; // skutki już są w modelu rozkładu ruchu
+      }
       if (inv.typ === "osiedle") {
         // nowe podróże autem rozkładają się na drogi w okolicy
         const T = p.mieszkania * z("osobNaMieszkanie") * z("podrozyNaOsobe") * z("udzialAuta");
@@ -295,14 +331,17 @@ export function wplywInwestycji(siec, investments, data) {
       console.warn("Model ruchu: pominięto inwestycję", inv.nazwa, e);
     }
   }
-  return { delta, mnoznik, nowe };
+  return { delta, mnoznik, nowe, zModelu };
 }
 
 // Ruch dobowy (SDR) odcinków po uwzględnieniu inwestycji
 function sdrOdcinkow(siec, wplyw) {
   const lista = siec.odcinki.map((o, i) => ({
     o,
-    sdr: Math.max(o.sdr * 0.3, o.sdr * wplyw.mnoznik[i] + wplyw.delta[i]) * (wplyw.mnoznik[i] < 0.1 ? 0.05 : 1),
+    // z modelu rozkładu ruchu zmiana jest dokładna (zamknięta ulica = 0); inaczej ostrożne szacunki
+    sdr: wplyw.zModelu
+      ? Math.max(0, o.sdr * wplyw.mnoznik[i] + wplyw.delta[i])
+      : Math.max(o.sdr * 0.3, o.sdr * wplyw.mnoznik[i] + wplyw.delta[i]) * (wplyw.mnoznik[i] < 0.1 ? 0.05 : 1),
   }));
   for (const o of wplyw.nowe) lista.push({ o, sdr: o.sdr });
   return lista;
@@ -319,7 +358,9 @@ function ocenGodzine(lista, profil, h, skala) {
     const V = sdr * skala * profil[h]; // poj./h na jezdni
     const r = (V * o.kier) / o.cap;
     vc[i] = r;
-    const tw = czasWzgl(r);
+    // powyżej ok. 1,25 przepustowości szczyt „rozlewa się” na sąsiednie godziny (kolejki, zmiana
+    // pory wyjazdu) – czas przejazdu nie rośnie już tak, jak wynikałoby z samego wzoru BPR
+    const tw = czasWzgl(Math.min(r, 1.25));
     const wagi = V * o.dl;
     sumaVL += wagi;
     sumaOpoz += wagi * (tw - 1);
@@ -352,6 +393,7 @@ export function analizaRuchu(siec, investments, data, { rok = ROK_BAZOWY } = {})
     zakorkowanieDzien: godziny.reduce((a, b, h) => a + b * PROFIL_ROBOCZY[h], 0),
     pojGodzDzien, // pojazdogodziny na dobę
     halas: halas(lista, investments, data),
+    zModelu: wplyw.zModelu, // skutki z modelu rozkładu ruchu (a nie z szacunków)
   };
 }
 

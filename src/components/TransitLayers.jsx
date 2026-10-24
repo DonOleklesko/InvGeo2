@@ -3,7 +3,7 @@
 import { memo } from "react";
 import { GeoJSON, CircleMarker, Tooltip } from "react-leaflet";
 import * as turf from "@turf/turf";
-import { lineColor, lineLabel } from "../data/lineColors.js";
+import { lineColor, lineLabel, czyTramwajowy } from "../data/lineColors.js";
 import { fmtHa } from "../model/simulate.js";
 
 // ---------- LINIE ----------
@@ -54,10 +54,10 @@ export function LinesLayer({ lines, visible, highlighted, onHover }) {
 export const StopsLayer = memo(function StopsLayer({ stops, linesById, onHover }) {
   if (!stops) return null;
   const normal = (f) => ({
-    radius: f.properties.railway === "tram_stop" ? 4 : 3.5,
+    radius: czyTramwajowy(f.properties) ? 4 : 3.5,
     color: "#fff",
     weight: 1,
-    fillColor: f.properties.railway === "tram_stop" ? "#c92a2a" : "#1864ab",
+    fillColor: czyTramwajowy(f.properties) ? "#c92a2a" : "#1864ab",
     fillOpacity: 0.9,
   });
   return stops.features.map((f) => (

@@ -27,15 +27,20 @@ out body;`,
     },
     stops: {
       label: "Przystanki",
-      kind: "points",
-      // perony (miejsca, gdzie czekają pasażerowie) – tak samo oznaczone są w trasach linii
-      query: `[out:json][timeout:60];
+      kind: "stops",
+      // perony (punkty i obszary) oraz punkty zatrzymania na jezdni / torowisku – w części miast
+      // (np. Bydgoszcz) wiele przystanków ma w OSM tylko jedno z nich; scalamy je w convert.js
+      query: `[out:json][timeout:90];
 (
   node["highway"="bus_stop"](${bb});
+  way["highway"="bus_stop"](${bb});
   node["public_transport"="platform"](${bb});
+  way["public_transport"="platform"]["railway"!="platform"](${bb});
   node["railway"="tram_stop"](${bb});
+  node["public_transport"="stop_position"]["bus"="yes"](${bb});
+  node["public_transport"="stop_position"]["tram"="yes"](${bb});
 );
-out body;`,
+out center;`,
     },
     lines: {
       label: "Linie tramwajowe i autobusowe",
@@ -64,20 +69,38 @@ out center tags;`,
 (._;>;);
 out body;`,
     },
+    // drogi główne – także w budowie (highway=construction): wkrótce będą otwarte, a bez nich
+    // model proponowałby drogi, które miasto właśnie buduje
     roads: {
       label: "Drogi główne",
       kind: "lines",
       query: `[out:json][timeout:90];
-way["highway"~"^(motorway|trunk|primary|secondary|tertiary)(_link)?$"](${bb});
+(
+  way["highway"~"^(motorway|trunk|primary|secondary|tertiary)(_link)?$"](${bb});
+  way["highway"="construction"]["construction"~"^(motorway|trunk|primary|secondary|tertiary)(_link)?$"](${bb});
+);
 out geom tags;`,
     },
-    // ulice lokalne – razem z drogami głównymi tworzą sieć, po której prowadzimy nowe trasy
+    // ulice lokalne i drogi dojazdowe (service) – bez nich model „nie widzi” istniejących
+    // połączeń i proponuje drogi, które już są; bez prywatnych dojazdów i alejek parkingowych
     streets: {
       label: "Ulice lokalne",
       kind: "lines",
-      query: `[out:json][timeout:120];
-way["highway"~"^(unclassified|residential|living_street)$"](${bb});
+      query: `[out:json][timeout:180];
+(
+  way["highway"~"^(unclassified|residential|living_street|road)$"](${bb});
+  way["highway"="service"]["access"!~"^(private|no|customers|delivery)$"]["service"!~"^(parking_aisle|driveway|drive-through|emergency_access)$"](${bb});
+  way["highway"="construction"]["construction"~"^(unclassified|residential|living_street|road|service)$"](${bb});
+);
 out geom tags;`,
+    },
+    // budynki – zapisywane jako siatka zajętości (ok. 5 m), żeby nowe drogi omijały domy
+    buildings: {
+      label: "Budynki",
+      kind: "raster",
+      query: (bbKafla) => `[out:json][timeout:180];
+way["building"](${bbKafla});
+out skel geom qt;`,
     },
     // tereny zabudowy mieszkaniowej – popyt na przystanki (bez przystanków „na łące”)
     residential: {
@@ -96,6 +119,17 @@ out body;`,
       kind: "lines",
       query: `[out:json][timeout:60];
 way["waterway"="river"](${bb});
+out geom tags;`,
+    },
+    // przeszkody dla nowych dróg: tory kolejowe (wiadukt) i kanały (most)
+    railways: {
+      label: "Tory kolejowe i kanały",
+      kind: "lines",
+      query: `[out:json][timeout:90];
+(
+  way["railway"="rail"]["service"!~"yard|siding|spur"](${bb});
+  way["waterway"="canal"](${bb});
+);
 out geom tags;`,
     },
     parkings: {

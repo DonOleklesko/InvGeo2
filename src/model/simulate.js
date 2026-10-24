@@ -280,6 +280,7 @@ function simDroga(inv, data) {
   const dl = turf.length(inv.geometry, { units: "kilometers" }) * 1000;
   const klasa = KLASY_ULIC[inv.params.klasa] || KLASY_ULIC.zbiorcza;
   const most = !!inv.params.most;
+  const wiadukt = !!inv.params.wiadukt;
   const skrot = inv.params.skrot; // m, z automatycznej propozycji (może nie być)
   const przejety = klasa.natezenie * z("udzialSzczytu") * z("udzialPrzejetegoRuchu");
   const strefa = buffer(inv.geometry, z("promienPrzystanku"));
@@ -287,14 +288,21 @@ function simDroga(inv, data) {
   const pasHalasu = buffer(inv.geometry, 100);
   const naHalas = pasHalasu ? km(km(turf.area(pasHalasu))) * z("gestoscMiasta") : 0;
   const kmDziennie = skrot ? (klasa.natezenie * z("udzialPrzejetegoRuchu") * skrot) / 1000 : 0;
-  const koszt = dl * z("kosztDrogiNaM") + (most ? z("kosztMostu") : 0);
+  // most "maly" – mniejsza rzeka lub kanał; true / "duzy" – duża rzeka (domyślny koszt mostu)
+  const kosztMostu = most ? z(inv.params.most === "maly" ? "kosztMostuMalego" : "kosztMostu") : 0;
+  const koszt = dl * z("kosztDrogiNaM") + kosztMostu + (wiadukt ? z("kosztWiaduktu") : 0);
 
   const kompromisy = [
     { typ: "plus", tekst: `Ok. ${fmtInt(przejety)} pojazdów/h w szczycie przejdzie z zatłoczonych ulic na nową drogę.` },
     { typ: "minus", tekst: `Więcej hałasu i spalin dla ok. ${fmtInt(naHalas)} osób w pasie 100 m.` },
   ];
   if (skrot) kompromisy.push({ typ: "plus", tekst: `Krótsze trasy: ok. ${fmtInt(kmDziennie)} km mniej przejechanych dziennie.` });
-  if (most) kompromisy.push({ typ: "minus", tekst: `Droga przecina ${MIASTO.rzeka} – potrzebny most (+${fmtZl(z("kosztMostu"))}).` });
+  if (most)
+    kompromisy.push({
+      typ: "minus",
+      tekst: inv.params.most === "maly" ? `Droga przecina rzekę lub kanał – potrzebny most (+${fmtZl(kosztMostu)}).` : `Droga przecina ${MIASTO.rzeka} – potrzebny most (+${fmtZl(kosztMostu)}).`,
+    });
+  if (wiadukt) kompromisy.push({ typ: "minus", tekst: `Droga przecina tory kolejowe – potrzebny wiadukt (+${fmtZl(z("kosztWiaduktu"))}).` });
   if (!przystanki.length)
     kompromisy.push({ typ: "uwaga", tekst: `Brak przystanku w ${z("promienPrzystanku")} m – warto dodać linię autobusową.` });
   if (inv.params.klasa === "glowna")
@@ -325,11 +333,12 @@ function simDroga(inv, data) {
       ["Odciążenie ulic", `−${fmtInt(przejety)} poj./h`],
       ...(skrot ? [["Skrócenie trasy", `${(skrot / 1000).toFixed(1)} km`]] : []),
       ["Most", most ? "tak" : "nie"],
+      ["Wiadukt nad torami", wiadukt ? "tak" : "nie"],
       ["Przystanki ≤400 m", przystanki.length],
     ],
     wyjasnienia: [
       `Odciążenie = ${fmtInt(klasa.natezenie)} poj./dobę × ${z("udzialSzczytu")} (szczyt) × ${z("udzialPrzejetegoRuchu")} (ruch przejęty)`,
-      `Koszt = ${fmtInt(dl)} m × ${fmtInt(z("kosztDrogiNaM"))} zł/m${most ? ` + most ${fmtZl(z("kosztMostu"))}` : ""}`,
+      `Koszt = ${fmtInt(dl)} m × ${fmtInt(z("kosztDrogiNaM"))} zł/m${most ? ` + most ${fmtZl(kosztMostu)}` : ""}${wiadukt ? ` + wiadukt ${fmtZl(z("kosztWiaduktu"))}` : ""}`,
       ...(skrot ? [`Mniej km dziennie = ${fmtInt(klasa.natezenie)} poj. × ${z("udzialPrzejetegoRuchu")} × ${(skrot / 1000).toFixed(1)} km skrótu`] : []),
     ],
     kompromisy,
@@ -534,6 +543,34 @@ export function simulateInvestment(inv, data, zalKlucz = "") {
       const dGodz = a.pojGodzDzien - b.pojGodzDzien;
       const dHalas = a.halas.narazeni - b.halas.narazeni;
       wynik.ruch = { dZak, dGodz, dHalas };
+      // model rozkładu ruchu: ile aut pojedzie nową drogą / którędy pójdą objazdy
+      if (a.zModelu && inv.typ === "droga") {
+        const nowa = a.lista.find((x) => x.o.id === "nowa-" + inv.id);
+        if (nowa) {
+          wynik.szczegoly.unshift(["Ruch na nowej drodze (model)", `${fmtInt(nowa.sdr)} poj./dobę`]);
+          wynik.kompromisy.unshift({
+            typ: nowa.sdr >= 2000 ? "plus" : "uwaga",
+            tekst:
+              nowa.sdr >= 2000
+                ? `Model rozkładu ruchu: nową drogą pojedzie ok. ${fmtInt(nowa.sdr)} pojazdów na dobę (przejęte z innych ulic).`
+                : `Model rozkładu ruchu: nową drogą pojedzie tylko ok. ${fmtInt(nowa.sdr)} pojazdów na dobę – mało, droga słabo skraca przejazdy.`,
+          });
+        }
+      }
+      if (a.zModelu && inv.typ === "zamkniecie") {
+        const zm = a.lista
+          .slice(0, b.lista.length)
+          .map((x, i) => ({ n: x.o.nazwa, d: x.sdr - b.lista[i].sdr }))
+          .filter((x) => x.d > 300)
+          .sort((x, y) => y.d - x.d);
+        const naz = [];
+        for (const x of zm) if (x.n && !naz.some((q) => q.n === x.n)) naz.push(x);
+        if (naz.length) {
+          const top = naz.slice(0, 3).map((x) => `${x.n} (+${fmtInt(x.d)})`).join(", ");
+          wynik.szczegoly.unshift(["Objazdy (model)", top]);
+          wynik.kompromisy.unshift({ typ: "minus", tekst: `Model rozkładu ruchu: auta pojadą objazdami – najwięcej przybędzie na: ${top} poj./dobę. Mapa: warstwa „Zmiana ruchu”.` });
+        }
+      }
       wynik.szczegoly.push(
         ["Zakorkowanie w szczycie", `${dZak > 0 ? "+" : ""}${dZak.toFixed(2)} p.p.`],
         ["Czas w korkach (miasto)", `${dGodz > 0 ? "+" : ""}${fmtInt(dGodz)} poj.-h/dzień`],

@@ -395,6 +395,9 @@ summary { cursor: pointer; color: var(--accent); }
 }
 .proposals li.dojazd { border-left-color: #d9480f; }
 .proposals li.parkride { border-left-color: #0c8599; }
+.proposals li.linia { border-left-color: #f08c00; }
+.tp-model { font-size: 12px; margin: 4px 0 6px; color: var(--ink-2); }
+.tp-model.liczy { color: var(--muted); font-style: italic; }
 .proposals li.blocked { opacity: 0.6; }
 .proposals li .grow, .zones li .grow { display: flex; flex-direction: column; gap: 2px; }
 .zones li { border-left-color: var(--line-strong); }

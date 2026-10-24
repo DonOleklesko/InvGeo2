@@ -10,4 +10,7 @@ export function lineColor(props) {
   return `hsl(${hue}, 60%, 40%)`;
 }
 
+// przystanek tramwajowy: punkt zatrzymania na torowisku albo peron tylko dla tramwajów
+export const czyTramwajowy = (p) => p.railway === "tram_stop" || (p.tram === "yes" && p.bus !== "yes");
+
 export const lineLabel = (p) => `${p.mode === "tram" ? "Tramwaj" : p.nocna ? "Autobus nocny" : "Autobus"} ${p.ref}`;

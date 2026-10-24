@@ -78,16 +78,84 @@ export function zbudujSiatke(wsp, rozmiar = 0.001) {
   };
 }
 
-let cache = { roads: null, streets: null, siec: null };
+// ---------- ZABUDOWA ----------
+// Siatka komórek ok. 100 m: czy w komórce jest zabudowa mieszkaniowa albo strefa pracy (OSM).
+// Służy do odróżnienia ulic w mieście od dróg przez pola i lasy.
+const OKO_ZAB = 0.0012; // ° (ok. 80 × 130 m)
+const kluczZab = (lon, lat) => `${Math.floor(lon / OKO_ZAB)}:${Math.floor(lat / (OKO_ZAB * 0.6))}`;
 
-// Graf drogowy (liczony raz dla danych OSM)
+function wPierscieniu(x, y, r) {
+  let w = false;
+  for (let i = 0, j = r.length - 1; i < r.length; j = i++) {
+    const [xi, yi] = r[i];
+    const [xj, yj] = r[j];
+    if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) w = !w;
+  }
+  return w;
+}
+
+const cacheZabudowy = new WeakMap();
+export function siatkaZabudowy(residential, zones) {
+  const klucz = residential || zones;
+  if (!klucz) return null;
+  const c = cacheZabudowy.get(klucz);
+  if (c && c.zones === zones) return c.s;
+  const s = new Set();
+  for (const f of [...(residential?.features || []), ...(zones?.features || [])]) {
+    const g = f.geometry;
+    const polys = g?.type === "Polygon" ? [g.coordinates] : g?.type === "MultiPolygon" ? g.coordinates : [];
+    for (const p of polys) {
+      const ring = p[0];
+      if (!ring?.length) continue;
+      let w = Infinity, so = Infinity, e = -Infinity, n = -Infinity;
+      for (const [x, y] of ring) {
+        s.add(kluczZab(x, y)); // wierzchołki (także wąskie tereny)
+        if (x < w) w = x;
+        if (x > e) e = x;
+        if (y < so) so = y;
+        if (y > n) n = y;
+      }
+      // środki komórek wewnątrz wielokąta
+      const dy = OKO_ZAB * 0.6;
+      for (let x = Math.floor(w / OKO_ZAB) * OKO_ZAB + OKO_ZAB / 2; x < e; x += OKO_ZAB)
+        for (let y = Math.floor(so / dy) * dy + dy / 2; y < n; y += dy) if (wPierscieniu(x, y, ring)) s.add(kluczZab(x, y));
+    }
+  }
+  cacheZabudowy.set(klucz, { zones, s });
+  return s;
+}
+
+// Czy punkt leży w zabudowie lub tuż przy niej (sąsiednie komórki, ok. 100–150 m)
+export function przyZabudowie(zab, [lon, lat], r = 1) {
+  if (!zab) return true;
+  const cx = Math.floor(lon / OKO_ZAB);
+  const cy = Math.floor(lat / (OKO_ZAB * 0.6));
+  for (let i = -r; i <= r; i++) for (let j = -r; j <= r; j++) if (zab.has(`${cx + i}:${cy + j}`)) return true;
+  return false;
+}
+
+// ---------- SIEĆ ----------
+// Mnożnik „kosztu” odcinka dla autobusu: linie trzymają się dróg głównych i zbiorczych,
+// ulice osiedlowe tylko na krótkich odcinkach, drogi przez pola i lasy – w ostateczności.
+const KOSZT_AUTOBUSU = {
+  motorway: 1.2, trunk: 1, primary: 1, secondary: 1, tertiary: 1.05,
+  unclassified: 1.5, residential: 1.7, road: 1.7, living_street: 6,
+  service: 5, // drogi dojazdowe i wewnętrzne (np. przez parkingi) – autobus tylko w ostateczności
+};
+const POZA_ZABUDOWA = { glowna: 1.25, lokalna: 3 }; // dodatkowy mnożnik poza zabudową
+
+let cache = { roads: null, streets: null, residential: null, siec: null };
+
+// Graf drogowy (liczony raz dla danych OSM). Każda krawędź: [węzeł, metry, koszt dla autobusu].
 export function siecDrogowa(data) {
   if (!data?.roads) return null;
-  if (cache.roads === data.roads && cache.streets === data.streets) return cache.siec;
+  if (cache.roads === data.roads && cache.streets === data.streets && cache.residential === data.residential) return cache.siec;
+  const zab = siatkaZabudowy(data.residential, data.zones);
   const idx = new Map();
   const wsp = [];
   const nazwa = [];
   const sasiedzi = [];
+  const glowna = []; // węzeł leży na drodze głównej (klasy roads)
   const wezel = (c, n) => {
     const k = klucz(c);
     let i = idx.get(k);
@@ -97,26 +165,57 @@ export function siecDrogowa(data) {
       wsp.push(c);
       nazwa.push(n);
       sasiedzi.push([]);
+      glowna.push(false);
     } else if (!nazwa[i] && n) nazwa[i] = n;
     return i;
   };
-  const features = [...data.roads.features, ...(data.streets?.features || [])];
-  for (const f of features) {
-    const g = f.geometry;
-    const linie = g?.type === "LineString" ? [g.coordinates] : g?.type === "MultiLineString" ? g.coordinates : [];
-    for (const l of linie) {
-      let prev = null;
-      for (const c of l) {
-        const i = wezel(c, f.properties?.name || "");
-        if (prev !== null && prev !== i) {
-          const d = dist(wsp[prev], c);
-          sasiedzi[prev].push([i, d]);
-          sasiedzi[i].push([prev, d]);
+  const dodaj = (features, czyGlowna) => {
+    for (const f of features) {
+      const g = f.geometry;
+      const linie = g?.type === "LineString" ? [g.coordinates] : g?.type === "MultiLineString" ? g.coordinates : [];
+      const hw = (f.properties?.highway || "").replace("_link", "");
+      const mn = KOSZT_AUTOBUSU[hw] ?? (czyGlowna ? 1 : 1.7);
+      for (const l of linie) {
+        let prev = null;
+        for (const c of l) {
+          const i = wezel(c, f.properties?.name || "");
+          if (czyGlowna) glowna[i] = true;
+          if (prev !== null && prev !== i) {
+            const p = wsp[prev];
+            const d = dist(p, c);
+            const srodek = [(p[0] + c[0]) / 2, (p[1] + c[1]) / 2];
+            const poza = przyZabudowie(zab, srodek) ? 1 : czyGlowna ? POZA_ZABUDOWA.glowna : POZA_ZABUDOWA.lokalna;
+            const k = d * mn * poza;
+            sasiedzi[prev].push([i, d, k]);
+            sasiedzi[i].push([prev, d, k]);
+          }
+          prev = i;
         }
-        prev = i;
       }
     }
+  };
+  dodaj(data.roads.features, true);
+  dodaj(data.streets?.features || [], false);
+
+  // spójne części sieci: trasy prowadzimy tylko po największej (bez „wysp” – np. dróg
+  // wewnętrznych, które w danych nie łączą się z resztą miasta)
+  const czesc = new Int32Array(wsp.length).fill(-1);
+  const rozmiary = [];
+  for (let s = 0; s < wsp.length; s++) {
+    if (czesc[s] !== -1) continue;
+    const nr = rozmiary.length;
+    let n = 0;
+    const stos = [s];
+    czesc[s] = nr;
+    while (stos.length) {
+      const v = stos.pop();
+      n++;
+      for (const [m] of sasiedzi[v]) if (czesc[m] === -1) (czesc[m] = nr), stos.push(m);
+    }
+    rozmiary.push(n);
   }
+  const glownaCzesc = rozmiary.indexOf(Math.max(...rozmiary));
+
   // skrzyżowanie = co najmniej 3 różnych sąsiadów
   const skrzyzowania = [];
   sasiedzi.forEach((s, i) => {
@@ -124,22 +223,24 @@ export function siecDrogowa(data) {
   });
   const siatka = zbudujSiatke(wsp);
   const siatkaSkrz = zbudujSiatke(skrzyzowania.map((i) => wsp[i]));
-  const siec = { wsp, nazwa, sasiedzi, siatka, skrzyzowania, siatkaSkrz };
-  cache = { roads: data.roads, streets: data.streets, siec };
+  const siec = { wsp, nazwa, sasiedzi, glowna, czesc, glownaCzesc, zab, idx, siatka, skrzyzowania, siatkaSkrz };
+  cache = { roads: data.roads, streets: data.streets, residential: data.residential, siec };
   return siec;
 }
 
-// Najbliższy węzeł sieci (do ok. 400 m)
-export function najblizszyWezel(siec, c) {
+// Najbliższy węzeł sieci (do ok. 400 m). Domyślnie tylko w głównej, spójnej części sieci –
+// wtedy trasa zawsze da się poprowadzić (zamiast prostej kreski przez pola).
+export function najblizszyWezel(siec, c, { maks = 400, wszystkie = false } = {}) {
   let best = null;
-  for (const r of [1, 3]) {
+  for (const r of [1, 3, 6]) {
     for (const i of siec.siatka.obok(c, r)) {
+      if (!wszystkie && siec.czesc && siec.czesc[i] !== siec.glownaCzesc) continue;
       const d = dist(c, siec.wsp[i]);
       if (!best || d < best.d) best = { i, d };
     }
-    if (best) break;
+    if (best && best.d <= r * 70) break;
   }
-  return best && best.d < 400 ? best : null;
+  return best && best.d < maks ? best : null;
 }
 
 // Odległość punktu do najbliższego skrzyżowania (m)
@@ -149,8 +250,10 @@ export function doSkrzyzowania(siec, c) {
   return min;
 }
 
-// A* między dwoma węzłami; zwraca listę węzłów albo null
-function trasa(siec, a, b) {
+// A* między dwoma węzłami; zwraca listę węzłów albo null.
+// autobus: koszt odcinka zależy od klasy drogi i zabudowy (mnożniki ≥ 1, więc heurystyka
+// odległości w linii prostej nadal jest dopuszczalna); inaczej – sama długość.
+export function trasa(siec, a, b, { autobus = false } = {}) {
   if (a === b) return [a];
   const cel = siec.wsp[b];
   const g = new Map([[a, 0]]);
@@ -159,7 +262,7 @@ function trasa(siec, a, b) {
   h.push(dist(siec.wsp[a], cel), a);
   let kroki = 0;
   while (h.size && kroki++ < 400000) {
-    const [, n] = h.pop();
+    const [f, n] = h.pop();
     if (n === b) {
       const out = [b];
       let k = b;
@@ -167,8 +270,9 @@ function trasa(siec, a, b) {
       return out.reverse();
     }
     const gn = g.get(n);
-    for (const [m, w] of siec.sasiedzi[n]) {
-      const nd = gn + w;
+    if (f > gn + dist(siec.wsp[n], cel) + 1e-6) continue; // nieaktualny wpis w kopcu
+    for (const [m, d, k] of siec.sasiedzi[n]) {
+      const nd = gn + (autobus ? k : d);
       if (nd < (g.get(m) ?? Infinity)) {
         g.set(m, nd);
         skad.set(m, n);
@@ -181,7 +285,8 @@ function trasa(siec, a, b) {
 
 // Prowadzi trasę po sieci przez kolejne kliknięte punkty.
 // Zwraca { coords, ok, pominiete } – pominiete: odcinki bez połączenia w sieci (narysowane prosto)
-export function trasaPoSieci(siec, punkty) {
+// autobus: trasa jak dla linii autobusowej (drogi główne, bez dróg przez pola, jeśli się da)
+export function trasaPoSieci(siec, punkty, { autobus = false } = {}) {
   if (!siec || punkty.length < 2) return { coords: punkty, ok: false, pominiete: 0 };
   const wezly = punkty.map((p) => najblizszyWezel(siec, p));
   const coords = [];
@@ -189,7 +294,7 @@ export function trasaPoSieci(siec, punkty) {
   for (let k = 0; k < punkty.length - 1; k++) {
     const a = wezly[k];
     const b = wezly[k + 1];
-    const odc = a && b ? trasa(siec, a.i, b.i) : null;
+    const odc = a && b ? trasa(siec, a.i, b.i, { autobus }) : null;
     const seg = odc ? odc.map((i) => siec.wsp[i]) : [punkty[k], punkty[k + 1]];
     if (!odc) pominiete++;
     for (const c of seg) {

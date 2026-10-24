@@ -28,6 +28,15 @@ export const PASMA_RUCHU = [
   { do: Infinity, kolor: "#d03b3b", label: "zator" },
 ];
 // Pasma hałasu Lden przy drodze – jedna barwa, od jasnej do ciemnej
+// zmiana ruchu dobowego (wariant lub zaznaczona inwestycja − stan obecny)
+export const PASMA_ZMIANY = [
+  { od: 2000, kolor: "#c92a2a", label: "+2000 poj./dobę i więcej" },
+  { od: 300, kolor: "#f08c00", label: "+300…2000" },
+  { od: -2000, kolor: "#69db7c", label: "−300…2000" },
+  { od: -Infinity, kolor: "#2b8a3e", label: "−2000 i mniej" },
+];
+export const pasmoZmiany = (d) => PASMA_ZMIANY.find((p) => d >= p.od) || PASMA_ZMIANY[PASMA_ZMIANY.length - 1];
+
 export const PASMA_HALASU = [
   { do: 60, kolor: "#d0bfff", label: "< 60 dB" },
   { do: 65, kolor: "#9775fa", label: "60–65 dB" },
@@ -124,7 +133,7 @@ function Wykres({ serie, xs, xLabel, zaznaczone, onKlik, formatX, tytul }) {
 }
 
 export default function TrafficPanel({
-  warianty, activeId, warstwa, onWarstwa, godzina, onGodzina, weekend, onWeekend, rok, onRok, stanSieci,
+  warianty, activeId, warstwa, onWarstwa, godzina, onGodzina, weekend, onWeekend, rok, onRok, stanSieci, ruchInfo, zmianaInfo,
 }) {
   const [otwarty, setOtwarty] = useState(true);
   // wysokość panelu ustawiana przeciąganiem górnej krawędzi (null = domyślna)
@@ -171,7 +180,7 @@ export default function TrafficPanel({
       .map((w) => ({ id: w.id, nazwa: `Wariant ${w.id}`, kolor: KOLOR_WARIANTU[w.id], aktywny: w.id === activeId, dane: w.lata.map((l) => l.wariant) })),
   ].filter((s) => s.dane);
 
-  const pasma = warstwa === "halas" ? PASMA_HALASU : PASMA_RUCHU;
+  const pasma = warstwa === "halas" ? PASMA_HALASU : warstwa === "zmiana" ? PASMA_ZMIANY : PASMA_RUCHU;
 
   return (
     <div
@@ -194,6 +203,7 @@ export default function TrafficPanel({
             ["brak", "Bez warstwy"],
             ["ruch", "Natężenie"],
             ["halas", "Hałas"],
+            ["zmiana", "Zmiana ruchu"],
           ].map(([k, l]) => (
             <button key={k} className={warstwa === k ? "on" : ""} onClick={() => onWarstwa(k)}>
               {l}
@@ -236,6 +246,8 @@ export default function TrafficPanel({
             </label>
           </div>
 
+          {ruchInfo && <p className={`tp-model ${ruchInfo.stan}`}>{ruchInfo.tekst}</p>}
+          {warstwa === "zmiana" && <p className="tp-model">{zmianaInfo || "Brak zmian: dodaj drogę, zamknięcie ulicy lub osiedle albo zaznacz taką inwestycję."}</p>}
           <div className="tp-kpis">
             <div className="kpi">
               <span>Zakorkowanie teraz</span>
@@ -319,8 +331,10 @@ export default function TrafficPanel({
             </table>
           )}
           <p className="muted small">
-            Model szacunkowy: ruch z klasy drogi, liczby pasów, położenia i stref pracy (OSM); profile godzinowe typowe
-            dla miast średniej wielkości; lata przed {ROK_BAZY} to rekonstrukcja (trend + spadek w pandemii 2020–21), nie
+            Model rozkładu ruchu: podróże autem między rejonami ok. 1 × 1 km (mieszkańcy i miejsca pracy z OSM, ludność
+            GUS, wjazdy spoza miasta), rozłożone na wszystkie ulice najszybszymi trasami z uwzględnieniem korków (BPR,
+            8 iteracji). Nowe drogi, zamknięcia ulic i osiedla zmieniają trasy przejazdów – warstwa „Zmiana ruchu” pokazuje
+            objazdy. Profile godzinowe typowe dla miast średniej wielkości; lata przed {ROK_BAZY} to rekonstrukcja, nie
             pomiary. Inwestycje wchodzą stopniowo w latach 2028–2030.
           </p>
         </>

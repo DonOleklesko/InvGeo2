@@ -68,7 +68,51 @@ function przystankiZLiniami(stops) {
     .map((f) => ({ f, p: xy(f.geometry.coordinates), n: f.properties.linie.length }));
 }
 
-// Parkingi przy wjazdach do miasta, z dobrą komunikacją → kandydaci na Park & Ride
+// Drogi wlotowe: drogi główne, które przecinają granicę miasta (tą drogą przyjeżdżają ludzie
+// spoza miasta). Cała droga o tym samym numerze (np. DK10) lub nazwie to korytarz wlotowy.
+// Zwraca siatkę punktów (co ok. 50 m) i nazwę drogi.
+function korytarzeWlotowe(roads, miasto) {
+  const glowne = (roads?.features || []).filter((f) => /^(motorway|trunk|primary|secondary)$/.test(f.properties.highway || "") && f.geometry?.type === "LineString");
+  const klucz = (f) => f.properties.ref || f.properties.name || "";
+  const wlotowe = new Set();
+  for (const f of glowne) {
+    const c = f.geometry.coordinates;
+    if (!klucz(f)) continue;
+    let wew = false;
+    let zew = false;
+    for (const p of [c[0], c[Math.floor(c.length / 2)], c[c.length - 1]]) {
+      if (turf.booleanPointInPolygon(p, miasto)) wew = true;
+      else zew = true;
+    }
+    if (wew && zew) wlotowe.add(klucz(f));
+  }
+  const punkty = [];
+  for (const f of glowne) {
+    if (!wlotowe.has(klucz(f))) continue;
+    const c = f.geometry.coordinates.map(xy);
+    for (let i = 1; i < c.length; i++) {
+      const n = Math.max(1, Math.ceil(odl(c[i - 1], c[i]) / 50));
+      for (let k = 0; k <= n; k++) punkty.push({ p: [c[i - 1][0] + ((c[i][0] - c[i - 1][0]) * k) / n, c[i - 1][1] + ((c[i][1] - c[i - 1][1]) * k) / n], nazwa: f.properties.ref ? `${f.properties.name || "droga"} (${f.properties.ref})` : f.properties.name });
+    }
+  }
+  return punkty;
+}
+
+// 1 linia, 2–4 linie, 5+ linii (12–14 linii)
+const odmianaLinii = (n) => (n === 1 ? "linia" : n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 12 || n % 100 > 14) ? "linie" : "linii");
+
+// Linie, które dojeżdżają do centrum (trasa do 700 m od centrum) – z P&R jedzie się bez przesiadki
+function linieDoCentrum(lines) {
+  const out = new Set();
+  for (const l of lines?.features || []) {
+    const odc = l.geometry.type === "MultiLineString" ? l.geometry.coordinates : [l.geometry.coordinates];
+    if (odc.some((o) => o.some((c) => odl(xy(c), CENTRUM) < 700))) out.add(l.properties.id);
+  }
+  return out;
+}
+
+// Parkingi przy drogach WLOTOWYCH, z linią jadącą BEZPOŚREDNIO do centrum → kandydaci na Park & Ride.
+// P&R ma przechwytywać auta przyjeżdżające spoza miasta, zanim wjadą w zatłoczone ulice.
 export function proponujParkRide(data) {
   const parkingi = data.parkings?.features;
   const miasto = data.boundary?.features?.[0];
@@ -77,6 +121,9 @@ export function proponujParkRide(data) {
   if (!przyst.length) return [];
   const granica = odcinkiGranicy(miasto);
   const obok = siatkaPrzystankow(przyst, 300);
+  const wloty = korytarzeWlotowe(data.roads, miasto);
+  const wlotyObok = siatkaPrzystankow(wloty, 400);
+  const doCentrum = linieDoCentrum(data.lines);
 
   const kandydaci = [];
   for (const f of parkingi) {
@@ -94,12 +141,22 @@ export function proponujParkRide(data) {
         if (!najblizszy || d < najblizszy.d) najblizszy = { d, nazwa: s.f.properties.name };
       }
     }
-    if (linie.size < 2) continue;
+    // linie bezpośrednio do centrum (bez przesiadki)
+    const bezposrednie = [...linie].filter((l) => doCentrum.has(l));
+    if (!bezposrednie.length) continue;
     const dG = odlOdGranicy(p, granica);
-    if (dG > 3000) continue; // P&R ma przechwytywać auta przy wjeździe
-    const tram = [...linie].some((l) => l.startsWith("tram:"));
-    const ocena = linie.size + (tram ? 4 : 0) + Math.min(6, pojemnosc / 50) + (3000 - dG) / 1000;
-    kandydaci.push({ f, p, linie: linie.size, tram, ocena, dG, dC, najblizszy, pojemnosc });
+    // P&R ma przechwytywać auta przy wjeździe: w zewnętrznej części miasta (bliżej granicy niż centrum)
+    if (dG > 3500 || dG >= dC) continue;
+    // przy drodze wlotowej (do 400 m)
+    let wlot = null;
+    for (const w of wlotyObok(p)) {
+      const d = odl(p, w.p);
+      if (d < 400 && (!wlot || d < wlot.d)) wlot = { d, nazwa: w.nazwa };
+    }
+    if (!wlot) continue;
+    const tram = bezposrednie.some((l) => l.startsWith("tram:"));
+    const ocena = bezposrednie.length * 1.5 + (tram ? 5 : 0) + Math.min(6, pojemnosc / 50) + (3500 - dG) / 1000 - wlot.d / 200;
+    kandydaci.push({ f, p, linie: bezposrednie.length, tram, ocena, dG, dC, najblizszy, pojemnosc, wlot });
   }
   kandydaci.sort((a, b) => b.ocena - a.ocena);
   const wybrane = [];
@@ -115,7 +172,7 @@ export function proponujParkRide(data) {
     geometry: turf.point(k.f.geometry.coordinates),
     dlugosc: 0,
     most: false,
-    powod: `${k.linie} linii w 300 m${k.tram ? " (w tym tramwaj)" : ""}, ${(k.dG / 1000).toFixed(1)} km od granicy miasta, ${(k.dC / 1000).toFixed(1)} km do centrum${k.pojemnosc ? `, ${k.pojemnosc} miejsc` : ""}.`,
+    powod: `Przy drodze wlotowej ${k.wlot.nazwa || ""} (${Math.round(k.wlot.d)} m), ${(k.dG / 1000).toFixed(1)} km od granicy miasta; ${k.linie} ${odmianaLinii(k.linie)} bezpośrednio do centrum${k.tram ? " (w tym tramwaj)" : ""}, ${(k.dC / 1000).toFixed(1)} km${k.pojemnosc ? `; ${k.pojemnosc} miejsc` : ""}.`,
     parking: k.f,
   }));
 }
@@ -190,7 +247,8 @@ export function analizaStref(data, ruch) {
       dPrzyst,
       vc,
       problemy,
-      wezel: wezel && wezel.d > 500 ? wezel.f : null,
+      // dowóz proponujemy tylko strefie bez przystanku w 500 m (inaczej linia już tam dojeżdża)
+      wezel: dPrzyst > 500 && wezel ? wezel.f : null,
     });
   }
   return wynik.sort((a, b) => b.problemy.length - a.problemy.length || b.ha - a.ha).slice(0, 15);

@@ -14,13 +14,15 @@ import { TORUN_BOUNDARY_FALLBACK } from "./data/torunBoundary.js";
 import { MIASTA, MIASTO, PREFIKS, zmienMiasto } from "./data/miasta.js";
 import { budynkiNaTrasach } from "./data/buildings.js";
 import { TYPY, ustawZalozenia } from "./model/config.js";
-import { simulateInvestment, simulateVariant, kontekstRuchu } from "./model/simulate.js";
-import { proponujLaczniki, proponujDojazdy, przecinaRzeke } from "./model/roads.js";
+import { simulateInvestment, simulateVariant, kontekstRuchu, fmtInt } from "./model/simulate.js";
+import { proponujLaczniki, proponujDojazdy, przecinaRzeke, przecinaTory } from "./model/roads.js";
 import { proponujParkRide, analizaStref } from "./model/zones.js";
+import { proponujLinie } from "./model/linie.js";
 import { stanGodziny, zakorkowanieWLatach } from "./model/traffic.js";
 import { siecDrogowa, trasaPoSieci } from "./model/network.js";
 import { wyznaczPrzystanki, przystanekNaTrasie } from "./model/stops.js";
-import { liczWWatku } from "./model/watek.js";
+import { liczWWatku, ustawDaneWatku } from "./model/watek.js";
+import { przypiszRuch, scenariuszZInwestycji, kluczScenariusza, czyRuchowa } from "./model/przeplywy.js";
 import * as turf from "@turf/turf";
 
 // warianty i założenia są osobne dla każdego miasta
@@ -146,7 +148,7 @@ export default function App() {
 
   const loadAll = useCallback(async (force = false) => {
     const onRetry = (name) => (n) => setStatus((s) => ({ ...s, [name]: `ponawiam (${n})` }));
-    const warstwy = ["stops", "lines", "schools", "parks", "roads", "streets", "residential", "rivers", "zones", "parkings", "chargers", "hospitals"];
+    const warstwy = ["stops", "lines", "schools", "parks", "roads", "streets", "residential", "rivers", "railways", "zones", "parkings", "chargers", "hospitals"];
     if (!force) prefetchStatic(["boundary", ...warstwy]);
     setStatus((s) => ({ ...s, boundary: "ładowanie" }));
     let boundary = null;
@@ -167,7 +169,7 @@ export default function App() {
       bufor = {};
       if (Object.keys(b).length) setData((d) => ({ ...d, ...b }));
     };
-    const bezPrzyciecia = ["roads", "streets", "rivers", "lines", "residential"];
+    const bezPrzyciecia = ["roads", "streets", "rivers", "railways", "lines", "residential"];
     setStatus((s) => ({ ...s, ...Object.fromEntries(warstwy.map((n) => [n, "ładowanie"])) }));
     for (const name of warstwy) {
       try {
@@ -189,7 +191,11 @@ export default function App() {
   const data = useMemo(() => ({ ...raw, stops: stopsZLiniami }), [raw, stopsZLiniami]);
   // modele (sieć ulic, ruch, warianty) liczą się na odroczonych danych: najpierw rysuje się mapa,
   // potem w osobnym przebiegu model – zamiast jednego długiego zamrożenia przy starcie
-  const dataModelu = useDeferredValue(data);
+  // wyniki modelu rozkładu ruchu (liczone w wątku): stan obecny i scenariusze inwestycji
+  const [ruchBaza, setRuchBaza] = useState(null);
+  const [ruchWyniki, setRuchWyniki] = useState(() => new Map());
+  const dataZRuchem = useMemo(() => (ruchBaza ? { ...data, przeplywy: { baza: ruchBaza, wyniki: ruchWyniki } } : data), [data, ruchBaza, ruchWyniki]);
+  const dataModelu = useDeferredValue(dataZRuchem);
   const linesById = useMemo(
     () => Object.fromEntries((raw.lines?.features || []).map((f) => [f.properties.id, f.properties])),
     [raw.lines]
@@ -261,6 +267,74 @@ export default function App() {
 
   useEffect(() => zapisz(STORAGE_KEY, variants), [variants]);
 
+  // ---------- model rozkładu ruchu (w wątku) ----------
+  // stan obecny liczy się raz po wczytaniu danych; potem scenariusze: każdy wariant (jego nowe drogi,
+  // zamknięcia i osiedla razem) i każda taka inwestycja osobno (skutki zaznaczonej inwestycji)
+  const daneRuchu = useMemo(
+    () =>
+      data.roads && data.streets && data.residential && data.boundary
+        ? { roads: data.roads, streets: data.streets, residential: data.residential, zones: data.zones, boundary: data.boundary }
+        : null,
+    [data.roads, data.streets, data.residential, data.zones, data.boundary]
+  );
+  useEffect(() => {
+    if (!daneRuchu) return;
+    let aktualne = true;
+    ustawDaneWatku("ruch", daneRuchu);
+    setRuchBaza(null);
+    setRuchWyniki(new Map());
+    liczWWatku("ruch", { nazwa: "ruch", scenariusz: null }, () => przypiszRuch(daneRuchu, {})).then((w) => aktualne && w && setRuchBaza(w));
+    return () => {
+      aktualne = false;
+    };
+  }, [daneRuchu]);
+  const potrzebneScenariusze = useMemo(() => {
+    const m = new Map();
+    for (const v of Object.values(variants)) {
+      const r = v.investments.filter(czyRuchowa);
+      if (!r.length) continue;
+      m.set(kluczScenariusza(v.investments), r);
+      for (const inv of r) m.set(kluczScenariusza([inv]), [inv]);
+    }
+    return m;
+  }, [variants]);
+  const potrzebneRef = useRef(potrzebneScenariusze);
+  potrzebneRef.current = potrzebneScenariusze;
+  const wToku = useRef(new Set());
+  useEffect(() => {
+    if (!ruchBaza || !daneRuchu) return;
+    const brak = [...potrzebneScenariusze.entries()].filter(([k]) => !ruchWyniki.has(k) && !wToku.current.has(k));
+    if (!brak.length) return;
+    // krótka zwłoka: przesuwanie suwaka (np. liczby mieszkań) nie zleca dziesiątek obliczeń
+    const t = setTimeout(async () => {
+      for (const [k, invs] of brak) {
+        if (wToku.current.has(k) || !potrzebneRef.current.has(k)) continue;
+        wToku.current.add(k);
+        const scenariusz = scenariuszZInwestycji(invs);
+        try {
+          const w = await liczWWatku("ruch", { nazwa: "ruch", scenariusz }, () => przypiszRuch(daneRuchu, scenariusz));
+          // zostawiamy tylko wyniki, które są jeszcze potrzebne (pamięć)
+          if (w)
+            setRuchWyniki((m) => {
+              const n = new Map([...m].filter(([kk]) => potrzebneRef.current.has(kk)));
+              return n.set(k, w);
+            });
+        } finally {
+          wToku.current.delete(k);
+        }
+      }
+    }, 600);
+    return () => clearTimeout(t);
+  }, [potrzebneScenariusze, ruchBaza, ruchWyniki, daneRuchu]);
+  const brakujaceRuchu = [...potrzebneScenariusze.keys()].filter((k) => !ruchWyniki.has(k)).length;
+  const ruchInfo = !daneRuchu
+    ? null
+    : !ruchBaza
+      ? { stan: "liczy", tekst: "Model rozkładu ruchu: liczę stan obecny (w tle, do kilkunastu sekund)…" }
+      : brakujaceRuchu
+        ? { stan: "liczy", tekst: `Model rozkładu ruchu: liczę skutki inwestycji (${brakujaceRuchu})…` }
+        : { stan: "ok", tekst: `Model rozkładu ruchu: ${ruchBaza.sumy.strefy} rejonów, ${ruchBaza.sumy.wjazdy} wjazdów do miasta, ok. ${fmtInt(ruchBaza.sumy.podrozeDoba)} podróży autem dziennie.` };
+
   const active = variants[activeId];
   const osiedla = active.investments.filter((i) => i.typ === "osiedle");
 
@@ -278,11 +352,12 @@ export default function App() {
 
   // trasa po istniejących ulicach (albo swobodnie, gdy zasada jest nadpisana).
   // Sieć ulic budowana dopiero przy pierwszej trasie (potem z pamięci) – nie spowalnia startu.
+  // autobus: trasa jak dla linii (drogi główne i zbiorcze, bez dróg przez pola, gdy jest inna droga)
   const poprowadz = useCallback(
-    (geometry, wolno) => {
+    (geometry, wolno, { autobus = false } = {}) => {
       const siec = wolno ? null : siecDrogowa(data);
       if (wolno || !siec) return { geometry, info: wolno ? null : "Sieć ulic jeszcze się wczytuje – trasa narysowana swobodnie." };
-      const { coords, pominiete } = trasaPoSieci(siec, coordsLinii(geometry));
+      const { coords, pominiete } = trasaPoSieci(siec, coordsLinii(geometry), { autobus });
       return {
         geometry: turf.lineString(coords),
         info: pominiete ? `${pominiete} odcinek(ki) trasy nie mają połączenia w sieci ulic – narysowano je prosto.` : null,
@@ -312,7 +387,7 @@ export default function App() {
       const params = { ...t.domyslne };
       if (t.rysuj === "Line") {
         // po ulicach tylko autobus i zamknięcie; tramwaj i nowa droga biegną tak, jak narysowano
-        const r = poprowadz(geometry, swobodnie || !t.poUlicach);
+        const r = poprowadz(geometry, swobodnie || !t.poUlicach, { autobus: typ === "autobus" });
         geo = r.geometry;
         params.swobodnie = swobodnie && !!t.poUlicach;
         if (r.info) pokaz(r.info);
@@ -322,9 +397,23 @@ export default function App() {
       setVariants((v) => {
         const n = v[activeId].investments.filter((i) => i.typ === typ).length + 1;
         const inv = { id, typ, nazwa: `${t.label} ${n}`, params, geometry: geo };
-        if (typ === "droga") inv.params.most = przecinaRzeke(geo, data.rivers);
+        if (typ === "droga") {
+          inv.params.most = przecinaRzeke(geo, data.rivers, data.railways);
+          inv.params.wiadukt = przecinaTory(geo, data.railways);
+        }
         return { ...v, [activeId]: { ...v[activeId], investments: [...v[activeId].investments, inv] } };
       });
+      // nowa jezdnia / torowisko narysowane swobodnie: ostrzeżenie, gdy przebieg przecina budynki
+      if (typ === "droga" || typ === "tramwaj")
+        budynkiNaTrasach([{ id, geometry: geo }])
+          .then((w) => {
+            if (w[id] > 0)
+              pokaz(
+                `Uwaga: ${typ === "droga" ? "nowa droga" : "linia tramwajowa"} przecina ok. ${w[id]} bud. – popraw przebieg („Edytuj”) albo poprowadź po istniejących ulicach.`,
+                "err"
+              );
+          })
+          .catch(() => {});
       setSelectedId(id);
       setDrawType(null);
     },
@@ -390,7 +479,7 @@ export default function App() {
   const poprowadzPoUlicach = (id) => {
     const inv = active.investments.find((i) => i.id === id);
     if (!inv) return;
-    const r = poprowadz(inv.geometry, false);
+    const r = poprowadz(inv.geometry, false, { autobus: inv.typ === "autobus" });
     const params = { swobodnie: false };
     if ((inv.typ === "tramwaj" || inv.typ === "autobus") && inv.params.przystankiTryb !== "reczne") params.przystanki = przystankiDla(r.geometry);
     handleUpdate(id, { geometry: r.geometry, params });
@@ -421,40 +510,55 @@ export default function App() {
 
   // ---------- proponowane nowe drogi ----------
   // liczone raz, gdy są już drogi i rzeki (wcześniej przeliczało się przy każdej doczytanej warstwie)
-  const rzekiGotowe = !!data.rivers || status.rivers === "błąd";
+  const rzekiGotowe = (!!data.rivers || status.rivers === "błąd") && (!!data.railways || status.railways === "błąd");
   // łączniki i P&R liczą się w osobnym wątku – mapa nie zamarza przy starcie
   const [laczniki, setLaczniki] = useState([]);
   useEffect(() => {
-    if (!rzekiGotowe || !data.roads) return;
+    if (!rzekiGotowe || !data.roads || !data.streets) return;
     let aktualne = true;
-    const { roads, rivers, boundary } = data;
-    liczWWatku("laczniki", { roads, rivers, boundary }, () => proponujLaczniki(roads, rivers, boundary)).then((w) => aktualne && setLaczniki(w));
+    const { roads, streets, rivers, railways, boundary, residential, zones, parks } = data;
+    const dane = { roads, streets, rivers, railways, boundary, residential, zones, parks };
+    liczWWatku("laczniki", dane, () => proponujLaczniki(dane)).then((w) => aktualne && setLaczniki(w));
     return () => {
       aktualne = false;
     };
-  }, [rzekiGotowe, data.roads, data.rivers, data.boundary]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [rzekiGotowe, data.roads, data.streets, data.rivers, data.railways, data.boundary, data.residential, data.zones, data.parks]); // eslint-disable-line react-hooks/exhaustive-deps
   const osiedlaKlucz = JSON.stringify(osiedla.map((i) => [i.id, i.nazwa, i.geometry]));
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const dojazdy = useMemo(() => proponujDojazdy(data.roads, osiedla), [data.roads, osiedlaKlucz]);
   const [parkRide, setParkRide] = useState([]);
   useEffect(() => {
-    if (!data.parkings || !data.stops || !data.boundary) return;
+    if (!data.parkings || !data.stops || !data.boundary || !data.roads || !data.lines) return;
     let aktualne = true;
-    const dane = { parkings: data.parkings, stops: data.stops, boundary: data.boundary };
+    const dane = { parkings: data.parkings, stops: data.stops, boundary: data.boundary, roads: data.roads, lines: data.lines };
     liczWWatku("parkride", dane, () => proponujParkRide(dane)).then((w) => aktualne && setParkRide(w));
     return () => {
       aktualne = false;
     };
-  }, [data.parkings, data.stops, data.boundary]); // eslint-disable-line react-hooks/exhaustive-deps
-  const propozycje = useMemo(() => [...dojazdy, ...laczniki, ...parkRide], [dojazdy, laczniki, parkRide]);
+  }, [data.parkings, data.stops, data.boundary, data.roads, data.lines]); // eslint-disable-line react-hooks/exhaustive-deps
+  // linie autobusowe tam, gdzie zabudowa nie ma przystanku w zasięgu (też w osobnym wątku)
+  const [liniePropozycje, setLiniePropozycje] = useState([]);
+  useEffect(() => {
+    if (!data.roads || !data.streets || !data.residential || !data.stops || !data.lines || !data.boundary) return;
+    let aktualne = true;
+    const { roads, streets, residential, zones, stops, lines, boundary } = data;
+    const dane = { roads, streets, residential, zones, stops, lines, boundary };
+    liczWWatku("linie", dane, () => proponujLinie(dane)).then((w) => aktualne && setLiniePropozycje(w));
+    return () => {
+      aktualne = false;
+    };
+  }, [data.roads, data.streets, data.residential, data.zones, data.stops, data.lines, data.boundary]); // eslint-disable-line react-hooks/exhaustive-deps
+  const propozycje = useMemo(() => [...dojazdy, ...laczniki, ...liniePropozycje, ...parkRide], [dojazdy, laczniki, liniePropozycje, parkRide]);
   const dodanePropozycje = new Set(active.investments.map((i) => i.params?.propozycja).filter(Boolean));
 
   // kolizje propozycji z budynkami (OSM, na żądanie)
   const [zabudowa, setZabudowa] = useState({ status: "brak" });
-  // klucz: tylko propozycje dróg (P&R nie mają przebiegu), zapytanie po ustaniu zmian (warstwy doczytują się kolejno)
-  const drogiPropKlucz = propozycje.filter((p) => p.rodzaj !== "parkride").map((p) => p.id).join("|");
+  // klucz: tylko propozycje NOWYCH dróg (P&R nie mają przebiegu, linie jadą istniejącymi ulicami),
+  // zapytanie po ustaniu zmian (warstwy doczytują się kolejno)
+  const nowaDroga = (p) => p.rodzaj === "lacznik" || p.rodzaj === "dojazd";
+  const drogiPropKlucz = propozycje.filter(nowaDroga).map((p) => p.id).join("|");
   useEffect(() => {
-    const drogi = propozycje.filter((p) => p.rodzaj !== "parkride");
+    const drogi = propozycje.filter(nowaDroga);
     if (!drogi.length) return;
     const ac = new AbortController();
     const t = setTimeout(() => {
@@ -472,6 +576,23 @@ export default function App() {
   const addProposal = (p) => {
     if (dodanePropozycje.has(p.id)) return;
     if (p.rodzaj === "parkride") return addFromParking(p.parking, { parkRide: true, propozycja: p.id });
+    if (p.rodzaj === "linia") {
+      // linia biegnie istniejącymi ulicami – od razu z automatycznymi przystankami
+      const id = noweId();
+      const geometry = { type: "Feature", properties: {}, geometry: p.geometry.geometry };
+      updateActive((list) => [
+        ...list,
+        {
+          id,
+          typ: "autobus",
+          nazwa: p.nazwa.replace(/^Linia: /, ""),
+          params: { ...TYPY.autobus.domyslne, swobodnie: false, propozycja: p.id, przystanki: przystankiDla(geometry) },
+          geometry,
+        },
+      ]);
+      setSelectedId(id);
+      return;
+    }
     const budynki = zabudowa.wynik?.[p.id];
     if (budynki > 0 && !swobodnie) {
       pokaz(`Propozycja przecina ${budynki} bud. Zaznacz „Nadpisz zasadę: swobodny przebieg” nad mapą, aby ją mimo to dodać.`, "err");
@@ -482,7 +603,7 @@ export default function App() {
       id,
       typ: "droga",
       nazwa: p.nazwa,
-      params: { ...TYPY.droga.domyslne, most: p.most, skrot: p.skrot, propozycja: p.id, swobodnie: budynki > 0 },
+      params: { ...TYPY.droga.domyslne, most: p.most, wiadukt: p.wiadukt, skrot: p.skrot, propozycja: p.id, swobodnie: budynki > 0 },
       geometry: { type: "Feature", properties: {}, geometry: p.geometry.geometry },
     };
     updateActive((list) => [...list, inv]);
@@ -492,7 +613,7 @@ export default function App() {
   // linia autobusowa dowożąca do strefy pracy z najbliższego węzła przesiadkowego (po ulicach)
   const addZoneLine = (s) => {
     const id = noweId();
-    const r = poprowadz(turf.lineString([s.wezel.geometry.coordinates, s.srodek]), false);
+    const r = poprowadz(turf.lineString([s.wezel.geometry.coordinates, s.srodek]), false, { autobus: true });
     const inv = {
       id,
       typ: "autobus",
@@ -574,6 +695,40 @@ export default function App() {
   const zalKlucz = JSON.stringify(doLiczenia.zalozenia);
   const selected = active.investments.find((i) => i.id === selectedId) || null;
   const selectedCalc = doLiczenia.variants[activeId]?.investments.find((i) => i.id === selectedId) || null;
+
+  // ---------- zmiana ruchu: zaznaczona droga / zamknięcie / osiedle albo cały wariant ----------
+  const cechyUlic = useMemo(() => {
+    const m = new Map();
+    for (const f of [...(data.roads?.features || []), ...(data.streets?.features || [])])
+      if (f.geometry?.type === "LineString") m.set(f.properties.id, { wsp: f.geometry.coordinates, nazwa: f.properties.name || "" });
+    return m;
+  }, [data.roads, data.streets]);
+  const zmianyRuchu = useMemo(() => {
+    if (!ruchBaza) return null;
+    const sel = selected && czyRuchowa(selected) ? [selected] : null;
+    const invs = sel || active.investments.filter(czyRuchowa);
+    if (!invs.length) return null;
+    const w = ruchWyniki.get(kluczScenariusza(invs));
+    if (!w) return { lista: [], opis: "liczę…" };
+    const lista = [];
+    for (const [id, b] of ruchBaza.sdr) {
+      const d = (w.sdr.get(id)?.sdr ?? 0) - b.sdr;
+      const c = cechyUlic.get(id);
+      if (Math.abs(d) >= 300 && c) lista.push({ id, wsp: c.wsp, nazwa: c.nazwa, d, przed: b.sdr });
+    }
+    for (const inv of invs)
+      if (inv.typ === "droga") lista.push({ id: "nowa-" + inv.id, wsp: (inv.geometry.geometry || inv.geometry).coordinates, nazwa: inv.nazwa, d: w.nowe[inv.id] ?? 0, przed: 0, nowa: true });
+    lista.sort((a, b) => Math.abs(a.d) - Math.abs(b.d)); // większe zmiany rysowane na wierzchu
+    const wiecej = lista.filter((x) => x.d > 0 && !x.nowa).sort((a, b) => b.d - a.d)[0];
+    const mniej = lista.filter((x) => x.d < 0).sort((a, b) => a.d - b.d)[0];
+    const nowe = lista.filter((x) => x.nowa);
+    const opis =
+      `${sel ? `„${selected.nazwa}”` : `Wariant ${activeId}`}: ${lista.length} odcinków ulic ze zmianą ≥ 300 poj./dobę.` +
+      nowe.map((x) => ` Nowa droga „${x.nazwa}”: ok. ${fmtInt(x.d)} poj./dobę.`).join("") +
+      (wiecej ? ` Najwięcej przybywa: ${wiecej.nazwa || "ulica bez nazwy"} (+${fmtInt(wiecej.d)}).` : "") +
+      (mniej ? ` Najwięcej ubywa: ${mniej.nazwa || "ulica bez nazwy"} (−${fmtInt(-mniej.d)}).` : "");
+    return { lista, opis };
+  }, [ruchBaza, ruchWyniki, selected, active.investments, activeId, cechyUlic]);
   const wynikSel = useMemo(() => {
     if (!selectedCalc) return null;
     ustawZalozenia(doLiczenia.zalozenia);
@@ -815,6 +970,7 @@ export default function App() {
               onHoverStop={onHoverStop}
               warstwaRuchu={warstwaRuchu}
               stanSieci={stanSieci}
+              zmianyRuchu={zmianyRuchu?.lista}
               granica={granica}
               stops={stopsWidoczne}
               swobodnie={swobodnie}
@@ -843,6 +999,8 @@ export default function App() {
             rok={rok}
             onRok={setRok}
             stanSieci={stanSieci}
+            ruchInfo={ruchInfo}
+            zmianaInfo={zmianyRuchu?.opis}
           />
         </div>
         <ResultsPanel

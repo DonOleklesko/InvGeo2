@@ -123,15 +123,78 @@ export function pickCityBoundary(fc) {
 }
 
 // Dopisuje do każdego przystanku listę linii, które się na nim zatrzymują.
-// Przystanki bez żadnej linii i bez nazwy (np. perony kolejowe) odrzucamy.
+// Linia wskazuje przystanek przez peron albo punkt zatrzymania – oba są w „aliasy” przystanku.
+// Gdy linia nie ma w OSM listy przystanków (albo ma ich bardzo mało – np. część linii w Elblągu),
+// dopasowujemy przystanki leżące przy jej trasie (do 30 m).
+// Perony kolejowe odrzucamy.
+const PRZY_TRASIE = 30; // m
+
+function odlM([lon1, lat1], [lon2, lat2]) {
+  const kx = 111320 * Math.cos(((lat1 + lat2) / 2) * (Math.PI / 180));
+  return Math.hypot((lon2 - lon1) * kx, (lat2 - lat1) * 110540);
+}
+
 export function attachLinesToStops(stops, lines) {
   if (!stops) return stops;
-  const mapa = {};
-  for (const l of lines?.features || []) {
-    for (const s of l.properties.przystanki) (mapa[s] ??= []).push(l.properties.id);
+  const lista = stops.features.filter((f) => f.properties.railway !== "platform" && f.properties.train !== "yes");
+  const glowne = new Map(); // id lub alias -> id przystanku
+  for (const f of lista) {
+    glowne.set(f.properties.id, f.properties.id);
+    for (const a of f.properties.aliasy || []) glowne.set(a, f.properties.id);
   }
-  const features = stops.features
-    .filter((f) => f.properties.railway !== "platform" && f.properties.train !== "yes")
-    .map((f) => ({ ...f, properties: { ...f.properties, linie: mapa[f.properties.id] || [] } }));
+  const mapa = new Map();
+  const dodaj = (idPrzyst, idLinii) => {
+    const l = mapa.get(idPrzyst) || mapa.set(idPrzyst, new Set()).get(idPrzyst);
+    l.add(idLinii);
+  };
+
+  // siatka przystanków (ok. 70 m) do dopasowania po trasie
+  const OKO = 0.001;
+  let siatka = null;
+  const obok = (c) => {
+    if (!siatka) {
+      siatka = new Map();
+      for (const f of lista) {
+        const [x, y] = f.geometry.coordinates;
+        const k = `${Math.floor(x / OKO)}:${Math.floor(y / OKO)}`;
+        (siatka.get(k) || siatka.set(k, []).get(k)).push(f);
+      }
+    }
+    const cx = Math.floor(c[0] / OKO);
+    const cy = Math.floor(c[1] / OKO);
+    const out = [];
+    for (let i = -1; i <= 1; i++) for (let j = -1; j <= 1; j++) out.push(...(siatka.get(`${cx + i}:${cy + j}`) || []));
+    return out;
+  };
+
+  for (const l of lines?.features || []) {
+    const id = l.properties.id;
+    let trafione = 0;
+    for (const s of l.properties.przystanki) {
+      const g = glowne.get(s);
+      if (g) dodaj(g, id), trafione++;
+    }
+    // długość trasy (km) – linia miejska ma zwykle przystanek co 400–600 m w każdą stronę
+    const odcinki = l.geometry.type === "MultiLineString" ? l.geometry.coordinates : [l.geometry.coordinates];
+    let dl = 0;
+    for (const o of odcinki) for (let i = 1; i < o.length; i++) dl += odlM(o[i - 1], o[i]);
+    if (trafione >= Math.max(3, (dl / 1000) * 0.5)) continue;
+    // za mało przystanków w danych: dopasowanie po trasie (próbki co 15 m)
+    const juz = new Set();
+    for (const o of odcinki)
+      for (let i = 1; i < o.length; i++) {
+        const [a, b] = [o[i - 1], o[i]];
+        const n = Math.max(1, Math.ceil(odlM(a, b) / 15));
+        for (let k = 0; k <= n; k++) {
+          const c = [a[0] + ((b[0] - a[0]) * k) / n, a[1] + ((b[1] - a[1]) * k) / n];
+          for (const f of obok(c)) {
+            if (juz.has(f.properties.id) || odlM(c, f.geometry.coordinates) > PRZY_TRASIE) continue;
+            juz.add(f.properties.id);
+            dodaj(f.properties.id, id);
+          }
+        }
+      }
+  }
+  const features = lista.map((f) => ({ ...f, properties: { ...f.properties, linie: [...(mapa.get(f.properties.id) || [])] } }));
   return { ...stops, features };
 }

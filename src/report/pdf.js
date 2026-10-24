@@ -11,6 +11,7 @@ import { REFERENCYJNE, ZRODLA_OFICJALNE } from "../data/official.js";
 import { MIASTO } from "../data/miasta.js";
 import fontUrl from "dejavu-fonts-ttf/ttf/DejaVuSans.ttf?url";
 import fontBoldUrl from "dejavu-fonts-ttf/ttf/DejaVuSans-Bold.ttf?url";
+import { czyTramwajowy } from "../data/lineColors.js";
 
 const KOLOR_PKT = { przystanek: "#1864ab", tram: "#c92a2a", szkola: "#e67700", szpital: "#c92a2a", nowy: "#111111" };
 const OPIS_PKT = { przystanek: "przystanek", tram: "przystanek tramwajowy", szkola: "szkoła", szpital: "szpital", nowy: "przystanek linii" };
@@ -191,7 +192,7 @@ function wBliskosci(inv, fc, promien, max, typ, linesById) {
     out.push({
       coords: c,
       nazwa,
-      typ: typ === "przystanek" && f.properties.railway === "tram_stop" ? "tram" : typ,
+      typ: typ === "przystanek" && czyTramwajowy(f.properties) ? "tram" : typ,
       d,
       opis: linie.length ? `linie: ${[...new Set(linie)].slice(0, 10).join(", ")}` : "",
     });

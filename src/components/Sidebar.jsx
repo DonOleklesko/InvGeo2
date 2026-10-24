@@ -222,7 +222,11 @@ export default function Sidebar({
               <KlasaUlicy label="Klasa drogi" value={selected.params.klasa} onChange={(klasa) => onUpdate(selected.id, { params: { klasa } })} />
               <label className="check">
                 <input type="checkbox" checked={!!selected.params.most} onChange={(e) => onUpdate(selected.id, { params: { most: e.target.checked } })} />
-                Z mostem na Wiśle
+                Z mostem (przez rzekę lub kanał)
+              </label>
+              <label className="check">
+                <input type="checkbox" checked={!!selected.params.wiadukt} onChange={(e) => onUpdate(selected.id, { params: { wiadukt: e.target.checked } })} />
+                Z wiaduktem nad torami
               </label>
               <Przebieg inv={selected} onRouteOnRoads={onRouteOnRoads} />
               <Przystanki inv={selected} linia={false} onAutoStops={onAutoStops} />
@@ -279,10 +283,11 @@ export default function Sidebar({
         </Modul>
       )}
 
-      <Modul id="propozycje" tytul={`Propozycje: drogi i Park & Ride (${propozycje.length})`}>
+      <Modul id="propozycje" tytul={`Propozycje: drogi, linie i Park & Ride (${propozycje.length})`}>
         <p className="muted small">
-          Wyznaczane automatycznie z danych OSM: łączniki tam, gdzie dziś trzeba jechać dużym objazdem, dojazdy do nowych osiedli i
-          parkingi przy wjazdach do miasta (kandydaci na P&amp;R). Propozycje dróg są sprawdzane pod kątem kolizji z budynkami (OSM).
+          Wyznaczane automatycznie z danych OSM: łączniki tam, gdzie dziś trzeba jechać dużym objazdem (także ulicami lokalnymi) i
+          tylko w zabudowie; linie autobusowe do osiedli bez przystanku w 450 m (albo przedłużenia istniejących linii); dojazdy do
+          nowych osiedli i parkingi przy wjazdach do miasta (kandydaci na P&amp;R). Nowe drogi są sprawdzane pod kątem kolizji z budynkami (OSM).
         </p>
         {!drogiWczytane && <p className="muted">Czekam na dane o drogach…</p>}
         {drogiWczytane && propozycje.length === 0 && <p className="muted">Brak propozycji.</p>}
@@ -298,7 +303,7 @@ export default function Sidebar({
                 <div className="grow">
                   <b>{p.nazwa}</b>
                   <span className="muted small">
-                    {p.dlugosc ? `${Math.round(p.dlugosc)} m${p.most ? " · most" : ""} · ` : ""}
+                    {p.dlugosc ? `${Math.round(p.dlugosc)} m${p.most ? " · most" : ""}${p.wiadukt ? " · wiadukt" : ""} · ` : ""}
                     {p.powod}
                   </span>
                   {blok && (
